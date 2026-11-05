@@ -13,7 +13,7 @@ import fs from 'fs/promises';
 import { existsSync, mkdirSync, realpathSync, readdirSync } from 'fs';
 import os from 'os';
 import mongoose from 'mongoose';
-import authRoutes from './src/server/routes/auth.js';
+import authRoutes, { checkExpiry } from './src/server/routes/auth.js';
 import adminRoutes from './src/server/routes/admin.js';
 import supportRoutes from './src/server/routes/support.js';
 import jwt from 'jsonwebtoken';
@@ -53,7 +53,37 @@ const execAsync = promisify(exec);
 
 const app = express();
 mkdirSync(path.join(process.cwd(), 'apks'), { recursive: true });
+mkdirSync(path.join(process.cwd(), 'removed_apks'), { recursive: true });
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+
+// Helper to safely move or delete APK files between apks/ and removed_apks/
+async function handleApkFileMovement(downloadUrl: string | undefined, targetAction: 'move_to_removed' | 'permanent_delete') {
+  if (!downloadUrl) return;
+  const match = downloadUrl.match(/\/apks\/([^\/?#]+)/);
+  const fileName = match ? match[1] : path.basename(downloadUrl);
+  if (!fileName || !fileName.endsWith('.apk')) return;
+
+  const activePath = path.join(process.cwd(), 'apks', fileName);
+  const removedPath = path.join(process.cwd(), 'removed_apks', fileName);
+
+  try {
+    if (targetAction === 'move_to_removed') {
+      if (existsSync(activePath)) {
+        await fs.rename(activePath, removedPath).catch(async () => {
+          await fs.copyFile(activePath, removedPath);
+          await fs.unlink(activePath).catch(() => {});
+        });
+        console.log(`[StorageEngine] Moved APK "${fileName}" from apks/ to removed_apks/ (7-Day Backup Vault)`);
+      }
+    } else if (targetAction === 'permanent_delete') {
+      if (existsSync(activePath)) await fs.unlink(activePath).catch(() => {});
+      if (existsSync(removedPath)) await fs.unlink(removedPath).catch(() => {});
+      console.log(`[StorageEngine] Permanently deleted APK "${fileName}" from storage`);
+    }
+  } catch (err: any) {
+    console.warn(`[StorageEngine] APK file operation (${targetAction}) note:`, err.message);
+  }
+}
 
 app.use(cors({
   origin: '*',
@@ -253,6 +283,42 @@ async function ensureLinuxJavaAndSdk(sendProgress: (p: number, s: string) => voi
   console.log('[AutoSdk] Android SDK ready at:', sdkHome);
 }
 
+async function purgeGitHubAsset(token: string, repoOwner: string, repoName: string, filePath: string) {
+  try {
+    const getUrl = `https://api.github.com/repos/${repoOwner}/${repoName}/contents/${filePath}`;
+    const getRes = await fetch(getUrl, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'APKify-Builder'
+      }
+    });
+    if (getRes.ok) {
+      const data: any = await getRes.json();
+      const sha = data.sha;
+      if (sha) {
+        await fetch(getUrl, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'APKify-Builder'
+          },
+          body: JSON.stringify({
+            message: `chore: auto-purge ephemeral asset ${filePath}`,
+            sha,
+            branch: 'main'
+          })
+        });
+        console.log(`[Auto-Purge] Deleted ${filePath} from GitHub repository.`);
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Auto-Purge Warning] Failed to delete ${filePath}:`, err.message);
+  }
+}
+
 async function buildApkViaGitHubActions(
   jobId: string,
   url: string,
@@ -276,6 +342,7 @@ async function buildApkViaGitHubActions(
 
   let effectiveHtmlCode = htmlCode || '';
   let zipUrl = '';
+  const ephemeralUploads: string[] = [];
 
   if (zipData && zipData.trim()) {
     try {
@@ -311,6 +378,7 @@ async function buildApkViaGitHubActions(
 
       if (uploadRes.ok) {
         zipUrl = `uploads/${jobId}.zip`;
+        ephemeralUploads.push(uploadPath);
         effectiveHtmlCode = ''; // Prevent large multiline inputs in workflow dispatch
         console.log(`[GitHub Actions] Successfully uploaded ${uploadPath} for build ${jobId}`);
       } else {
@@ -347,6 +415,7 @@ async function buildApkViaGitHubActions(
 
       if (uploadRes.ok) {
         zipUrl = `uploads/${jobId}.zip`;
+        ephemeralUploads.push(uploadPath);
         effectiveHtmlCode = ''; // Packaging into zip protects against GitHub Actions 1024 char input limit
         console.log(`[GitHub Actions] Successfully uploaded HTML package ${uploadPath} for build ${jobId}`);
       }
@@ -383,6 +452,7 @@ async function buildApkViaGitHubActions(
 
       if (iconRes.ok) {
         iconUploadRelativePath = iconUploadPath;
+        ephemeralUploads.push(iconUploadPath);
         console.log(`[GitHub Actions] Successfully uploaded ${iconUploadPath} for build ${jobId}`);
       }
     } catch (iconErr: any) {
@@ -391,6 +461,7 @@ async function buildApkViaGitHubActions(
   }
 
   sendProgress(20, 'Triggering GitHub Actions 16GB Cloud Runner...');
+  try {
 
   const dispatchUrl = `https://api.github.com/repos/${repoOwner}/${repoName}/actions/workflows/build-apk.yml/dispatches`;
   const dispatchRes = await fetch(dispatchUrl, {
@@ -411,7 +482,7 @@ async function buildApkViaGitHubActions(
         html_code: effectiveHtmlCode || '',
         zip_url: zipUrl || '',
         icon_url: iconUploadRelativePath || '',
-        is_premium: isPremium ? 'true' : 'false'
+        is_premium: 'true' // Always 100% watermark-free
       }
     })
   });
@@ -495,7 +566,18 @@ async function buildApkViaGitHubActions(
     downloadUrl: directDownloadUrl
   });
 
-  return directDownloadUrl;
+    return directDownloadUrl;
+  } finally {
+    // Zero-trace ephemeral cleanup: instantly delete user zip & icon from GitHub repository
+    (async () => {
+      for (const filePath of ephemeralUploads) {
+        await purgeGitHubAsset(token, repoOwner, repoName, filePath).catch(() => {});
+      }
+      const apksDir = path.join(process.cwd(), 'apks');
+      const localZipPath = path.join(apksDir, `${jobId}_source.zip`);
+      await fs.unlink(localZipPath).catch(() => {});
+    })().catch(() => {});
+  }
 }
 
 async function buildApkLocally(
@@ -522,7 +604,7 @@ async function buildApkLocally(
     await sleep(1000);
     sendProgress(40, "Syncing assets and configurations...");
     await sleep(800);
-    sendProgress(45, "Injecting Splash Branding...");
+    sendProgress(45, "Finalizing app environment and configurations...");
     await sleep(500);
     
     if (iconUrl && iconUrl.trim()) {
@@ -841,103 +923,9 @@ async function buildApkLocally(
     await fs.mkdir(path.dirname(assetsConfigJson), { recursive: true }).catch(() => {});
     await fs.writeFile(assetsConfigJson, JSON.stringify(capConfigObj, null, 2));
 
-    if (!isPremium) {
-      sendProgress(45, "Injecting Splash Branding...");
-      const packagePath = packageId.replace(/\./g, '/');
-      const javaDir = path.join(tempDir, 'android', 'app', 'src', 'main', 'java', packagePath);
-      await fs.mkdir(javaDir, { recursive: true });
-
-      const splashActivityCode = `package ${packageId};
-
-import android.app.Activity;
-import android.content.Intent;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.widget.ImageView;
-
-public class SplashActivity extends Activity {
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_splash);
-
-        final ImageView logo = findViewById(R.id.splash_logo);
-        if (logo != null) logo.setAlpha(0f);
-        if (logo != null) logo.animate().alpha(1f).setDuration(300).start();
-
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (logo != null) logo.animate().alpha(0f).setDuration(300).start();
-            }
-        }, 1200);
-
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                Intent intent = new Intent(SplashActivity.this, MainActivity.class);
-                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(intent);
-                overridePendingTransition(0, 0);
-                finish();
-            }
-        }, 1500);
-    }
-}
-`;
-      await fs.writeFile(path.join(javaDir, 'SplashActivity.java'), splashActivityCode);
-
-      const layoutDir = path.join(tempDir, 'android', 'app', 'src', 'main', 'res', 'layout');
-      await fs.mkdir(layoutDir, { recursive: true });
-      const splashLayoutXml = `<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:gravity="center"
-    android:background="#FFFFFF">
-    <ImageView
-        android:id="@+id/splash_logo"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:src="@drawable/apkify_logo" />
-</LinearLayout>
-`;
-      await fs.writeFile(path.join(layoutDir, 'activity_splash.xml'), splashLayoutXml);
-
-      const drawableDir = path.join(tempDir, 'android', 'app', 'src', 'main', 'res', 'drawable');
-      await fs.mkdir(drawableDir, { recursive: true });
-      const workspaceLogoPath = path.join(process.cwd(), 'assets', 'apkify_logo.png');
-      const workspaceLogoJpgPath = path.join(process.cwd(), 'assets', 'apkify_logo.jpg');
-      if (existsSync(workspaceLogoPath)) {
-        await fs.copyFile(workspaceLogoPath, path.join(drawableDir, 'apkify_logo.png'));
-      } else if (existsSync(workspaceLogoJpgPath)) {
-        await fs.copyFile(workspaceLogoJpgPath, path.join(drawableDir, 'apkify_logo.jpg'));
-      } else {
-        const placeholderLogoB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-        await fs.writeFile(path.join(drawableDir, 'apkify_logo.png'), Buffer.from(placeholderLogoB64, 'base64'));
-      }
-
-      const manifestPath = path.join(tempDir, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
-      let manifestData = await fs.readFile(manifestPath, 'utf8');
-      const intentFilterRegex = /<intent-filter>[\s\S]*?<action android:name="android\.intent\.action\.MAIN" \/>[\s\S]*?<category android:name="android\.intent\.category\.LAUNCHER" \/>[\s\S]*?<\/intent-filter>/;
-      manifestData = manifestData.replace(intentFilterRegex, '');
-
-      const splashActivityTag = `
-        <activity
-            android:name=".SplashActivity"
-            android:exported="true"
-            android:theme="@style/AppTheme.NoActionBar">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-      `;
-      manifestData = manifestData.replace('<activity', splashActivityTag + '\n        <activity');
-      await fs.writeFile(manifestPath, manifestData, 'utf8');
-    }
+    // Watermark & Splash Branding completely removed - 100% clean app for all users
+    sendProgress(45, "Finalizing app environment and configurations...");
+    console.log("[local-build] Watermark and splash branding bypassed: 100% clean app.");
 
     sendProgress(50, "Injecting WebView URL configuration...");
     if (!htmlCode && !zipData) {
@@ -1232,6 +1220,9 @@ app.post('/api/build-apk', async (req, res) => {
     const userId = decoded ? (decoded.id || decoded._id || decoded.sub) : null;
     console.log('[API] /build-apk extracted userId:', userId);
     let user = userId ? await User.findById(userId).catch(() => null) : null;
+    if (user) {
+      user = await checkExpiry(user);
+    }
     
     const finalUserId = user ? user._id : userId;
     console.log('[API] /build-apk Build will be assigned to user ID:', finalUserId);
@@ -1280,7 +1271,7 @@ app.post('/api/build-apk', async (req, res) => {
 
     // CHECK 1 - Credit Check
     if (user && user.role !== 'admin' && user.credits_remaining <= 0) {
-      return res.status(403).json({ success: false, error: 'Your APK Build Credits have been exhausted. Please wait for your Free Plan renewal or upgrade to a Premium Plan.' });
+      return res.status(403).json({ success: false, error: 'Your daily quota of 3 APK builds has been reached for today. Your credits will automatically reset tonight at midnight (00:00). 100% Free building continues tomorrow!' });
     }
 
     // CHECK 2 - History Limit Check
@@ -1321,7 +1312,7 @@ app.post('/api/build-apk', async (req, res) => {
 
     sendProgress(5, "Starting local environment...");
 
-    const isPremiumDB = (user && user.role === 'admin') ? true : (user ? !user.watermark_enabled : false);
+    const isPremiumDB = true; // 100% Watermark-Free for all APKs! Zero watermark & zero in-app ads.
     
     const buildRunner = process.env.GITHUB_TOKEN
       ? buildApkViaGitHubActions(jobId, url || '', appName, packageId, sendProgress, htmlCode, zipData, isPremiumDB, iconUrl)
@@ -1336,6 +1327,7 @@ app.post('/api/build-apk', async (req, res) => {
             ? resultUrl
             : `/apks/${apkFilename}`;
 
+          const activeExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30-Day Active Retention
           await Build.create({
             id: jobId,
             user_id: finalUserId,
@@ -1343,10 +1335,14 @@ app.post('/api/build-apk', async (req, res) => {
             user_name: user ? user.fullName : '',
             apk_name: appName,
             status: 'Completed',
-            downloadUrl: finalDownloadUrl
+            downloadUrl: finalDownloadUrl,
+            active_expires_at: activeExpiry,
+            created_at: new Date(),
+            storage_folder: 'apks',
+            user_deleted: false
           }).catch((err) => console.error('[API] Failed to save build history:', err));
           
-          if (user) {
+          if (user && user.role !== 'admin') {
             user.credits_remaining = Math.max(0, user.credits_remaining - 1);
             await user.save();
           }
@@ -1386,7 +1382,7 @@ app.get('/api/builds', async (req, res) => {
   }
 });
 
-// DELETE /api/builds - Clear user build history (Soft delete into 7-Day Admin Safety Vault)
+// DELETE /api/builds - User build history deletion (Permanent or Move to 7-Day Removed Folder)
 app.delete('/api/builds', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -1398,18 +1394,32 @@ app.delete('/api/builds', async (req, res) => {
     if (!decoded) return res.status(401).json({ success: false, error: 'Invalid token' });
     
     const userId = decoded.id || decoded._id || decoded.sub;
-    const { ids } = req.body || {};
+    const { ids, deleteType = 'for_me' } = req.body || {};
     if (ids && Array.isArray(ids) && ids.length > 0) {
       const buildsToDelete = await Build.find({ _id: { $in: ids }, user_id: userId });
       const vaultExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      
       for (const build of buildsToDelete) {
-        // Soft delete: User cannot see it anymore, but file is retained for 7 days in Admin Safety Vault
-        build.user_deleted = true;
-        build.user_deleted_at = new Date();
-        build.vault_expires_at = vaultExpiry;
-        await build.save();
+        if (deleteType === 'permanent') {
+          await handleApkFileMovement(build.downloadUrl, 'permanent_delete');
+          await Build.deleteOne({ _id: build._id });
+        } else {
+          // 'for_me': Soft-delete to 7-Day Removed Folder
+          build.user_deleted = true;
+          build.user_deleted_at = new Date();
+          build.vault_expires_at = vaultExpiry;
+          build.delete_type = 'for_me';
+          build.storage_folder = 'removed_apks';
+          await handleApkFileMovement(build.downloadUrl, 'move_to_removed');
+          await build.save();
+        }
       }
-      return res.status(200).json({ success: true, message: 'Selected history cleared' });
+      return res.status(200).json({ 
+        success: true, 
+        message: deleteType === 'permanent' 
+          ? 'Selected builds permanently wiped' 
+          : 'Selected builds moved to 7-day backup vault' 
+      });
     } else {
       return res.status(400).json({ success: false, error: 'No IDs provided to delete' });
     }
@@ -1418,7 +1428,7 @@ app.delete('/api/builds', async (req, res) => {
   }
 });
 
-// DELETE /api/builds/:id - Clear specific build from user history (Soft delete into 7-Day Admin Safety Vault)
+// DELETE /api/builds/:id - Clear specific build from user history (Permanent or Move to 7-Day Removed Folder)
 app.delete('/api/builds/:id', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -1432,47 +1442,99 @@ app.delete('/api/builds/:id', async (req, res) => {
     const build = await Build.findOne({ _id: req.params.id, user_id: decoded.id });
     if (!build) return res.status(404).json({ success: false, error: 'Build not found' });
     
-    // Soft delete: User cannot see it anymore, but file is retained for 7 days in Admin Safety Vault
-    build.user_deleted = true;
-    build.user_deleted_at = new Date();
-    build.vault_expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    await build.save();
-    
-    return res.status(200).json({ success: true, message: 'Build deleted' });
+    const deleteType = req.body?.deleteType || req.query?.deleteType || 'for_me';
+
+    if (deleteType === 'permanent') {
+      await handleApkFileMovement(build.downloadUrl, 'permanent_delete');
+      await Build.deleteOne({ _id: build._id });
+      return res.status(200).json({ success: true, message: 'Build permanently wiped from system' });
+    } else {
+      // Soft delete: User cannot see it anymore, but file is retained for 7 days in removed_apks/
+      build.user_deleted = true;
+      build.user_deleted_at = new Date();
+      build.vault_expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      build.delete_type = 'for_me';
+      build.storage_folder = 'removed_apks';
+      await handleApkFileMovement(build.downloadUrl, 'move_to_removed');
+      await build.save();
+      return res.status(200).json({ success: true, message: 'Build moved to 7-day backup vault' });
+    }
   } catch (error: any) {
     return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Auto-purge builds in Safety Vault after 7-day retention has passed
-const purgeExpiredSafetyVaultBuilds = async () => {
+// Comprehensive Auto-Purge & Storage Management Engine
+const runSmartStoragePurgeEngine = async () => {
   try {
     const now = new Date();
-    const expiredBuilds = await Build.find({
+    console.log('[StorageEngine] Running scheduled storage hygiene check...');
+
+    // 1. Purge 7-Day Expired Vault APKs in removed_apks/
+    const expiredVaultBuilds = await Build.find({
       user_deleted: true,
       vault_expires_at: { $lte: now }
     });
     
-    if (expiredBuilds.length > 0) {
-      console.log('[SafetyVault] Auto-purging ' + expiredBuilds.length + ' expired vault builds...');
-      for (const build of expiredBuilds) {
-        if (build.downloadUrl) {
-          const fileName = build.downloadUrl.replace('/apks/', '');
-          const filePath = path.join(process.cwd(), 'apks', fileName);
-          try {
-            await fs.promises.unlink(filePath);
-          } catch (_) {}
-        }
+    if (expiredVaultBuilds.length > 0) {
+      console.log(`[StorageEngine] Auto-purging ${expiredVaultBuilds.length} expired vault builds (7-Day retention passed)...`);
+      for (const build of expiredVaultBuilds) {
+        await handleApkFileMovement(build.downloadUrl, 'permanent_delete');
+        await Build.deleteOne({ _id: build._id });
+      }
+    }
+
+    // 2. Purge 30-Day Expired Active Builds in apks/
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const expiredActiveBuilds = await Build.find({
+      user_deleted: { $ne: true },
+      $or: [
+        { active_expires_at: { $lte: now } },
+        { created_at: { $lte: thirtyDaysAgo } }
+      ],
+      status: 'Completed'
+    });
+
+    if (expiredActiveBuilds.length > 0) {
+      console.log(`[StorageEngine] Auto-purging ${expiredActiveBuilds.length} active builds past 30-day retention...`);
+      for (const build of expiredActiveBuilds) {
+        await handleApkFileMovement(build.downloadUrl, 'permanent_delete');
         build.status = 'Expired';
         build.downloadUrl = '';
         await build.save();
       }
     }
-  } catch (err) {
-    console.error('[SafetyVault] Hourly purge error:', err);
+
+    // 3. Storage Overflow FIFO Protection for removed_apks/
+    const removedApksDir = path.join(process.cwd(), 'removed_apks');
+    if (existsSync(removedApksDir)) {
+      const files = await fs.readdir(removedApksDir);
+      const apkFiles = files.filter(f => f.endsWith('.apk'));
+      const MAX_REMOVED_FILES = 30; // Safety cap
+      if (apkFiles.length > MAX_REMOVED_FILES) {
+        console.log(`[StorageEngine] removed_apks count (${apkFiles.length}) exceeds safety limit (${MAX_REMOVED_FILES}). Applying FIFO prune...`);
+        const fileStats = await Promise.all(
+          apkFiles.map(async (f) => {
+            const p = path.join(removedApksDir, f);
+            const stat = await fs.stat(p).catch(() => null);
+            return { file: f, path: p, mtime: stat ? stat.mtimeMs : 0 };
+          })
+        );
+        fileStats.sort((a, b) => a.mtime - b.mtime); // Oldest first
+        const toDelete = fileStats.slice(0, apkFiles.length - MAX_REMOVED_FILES);
+        for (const item of toDelete) {
+          await fs.unlink(item.path).catch(() => {});
+          console.log(`[StorageEngine] Pruned oldest vault file: ${item.file}`);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error('[StorageEngine] Error during storage purge cycle:', err.message);
   }
 };
-setInterval(purgeExpiredSafetyVaultBuilds, 60 * 60 * 1000);
+
+setTimeout(runSmartStoragePurgeEngine, 10000);
+setInterval(runSmartStoragePurgeEngine, 60 * 60 * 1000);
 
 // Final Error Handler
 app.use((err: any, req: any, res: any, next: any) => {
