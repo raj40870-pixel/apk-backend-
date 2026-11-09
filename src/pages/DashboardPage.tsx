@@ -1,0 +1,587 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { motion } from 'motion/react';
+import { Camera, Box, LogOut, Shield, User as UserIcon, Clock, Trash2, Download, Archive, X } from 'lucide-react';
+import { User as UserType } from '../types';
+import { logout, getStoredUser, fetchMe } from '../lib/auth';
+import { fetchBuildHistory, deleteBuildsAPI } from '../lib/freeCreditSystem';
+import { useNavigate } from 'react-router-dom';
+import { API_BASE_URL } from '../lib/api';
+
+interface DashboardPageProps {
+  user: UserType;
+  builds?: any[]; // Unused now
+  onLogout: () => void;
+}
+
+export default function DashboardPage({ user, onLogout: parentOnLogout }: DashboardPageProps) {
+  const navigate = useNavigate();
+  const [profileImage, setProfileImage] = useState<string | null>(user?.photoURL || null);
+  const [liveUser, setLiveUser] = useState<any>(user);
+  const currentUser = liveUser || user;
+  const [history, setHistory] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creditState, setCreditState] = useState({ 
+    creditsRemaining: getStoredUser()?.credits_remaining ?? 3, 
+    creditsLimit: 3, 
+    historyLimit: getStoredUser()?.history_limit ?? 10 
+  });
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [targetBuildIds, setTargetBuildIds] = useState<string[]>([]);
+  const [targetBuildName, setTargetBuildName] = useState<string>('');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const isAdmin = currentUser?.role === 'admin' || currentUser?.email === 'kamaljit444501@gmail.com';
+  const [resetCountdown, setResetCountdown] = useState<string>('In 7 Days');
+
+  useEffect(() => {
+    const updateCountdown = () => {
+      const refillSource = liveUser?.last_credit_refill || currentUser?.last_credit_refill;
+      if (!refillSource) {
+        setResetCountdown('Every 7 Days');
+        return;
+      }
+      const lastRefill = new Date(refillSource);
+      const nextRefill = new Date(lastRefill.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const now = new Date();
+      const diffMs = nextRefill.getTime() - now.getTime();
+
+      if (diffMs <= 0) {
+        setResetCountdown('Ready for Refill');
+      } else {
+        const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const hours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        if (days > 0) {
+          setResetCountdown(`In ${days}d ${hours}h`);
+        } else {
+          const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+          setResetCountdown(`In ${hours}h ${minutes}m`);
+        }
+      }
+    };
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 60000);
+    return () => clearInterval(interval);
+  }, [liveUser?.last_credit_refill, currentUser?.last_credit_refill]);
+
+  useEffect(() => {
+    // Fetch live user state on load
+    fetchMe().then((u) => {
+      if (u) {
+        setLiveUser(u);
+        setCreditState(prev => ({ 
+          ...prev, 
+          creditsRemaining: u.credits_remaining ?? 3,
+          creditsLimit: 3,
+          historyLimit: u.history_limit ?? 10
+        }));
+      }
+    });
+    if (!user) return;
+    
+    fetchBuildHistory().then((builds) => {
+      const normalized = builds.map((h: any) => ({
+        id: h._id,
+        app_name: h.apk_name || 'Untitled App',
+        app_version: '1.0.0',
+        created_at: h.created_at || h.createdAt || new Date().toISOString(),
+        status: h.status === 'Success' ? 'Completed' : (h.status || 'Completed'),
+        progress: 100,
+        downloadUrl: h.downloadUrl,
+      }));
+      setHistory(normalized);
+      setLoading(false);
+    }).catch(e => {
+      console.error('Failed to load build history:', e);
+      setHistory([]);
+      setLoading(false);
+    });
+  }, [user]);
+
+  if (!user) return null;
+
+  const handleLogout = () => {
+    logout();
+    parentOnLogout();
+    navigate('/');
+  };
+
+  const toggleSelection = (id: string) => {
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
+  };
+
+  const handleClearHistoryClick = () => {
+    setIsSelectionMode(true);
+    setSelectedIds([]);
+  };
+
+  const cancelSelectionMode = () => {
+    setIsSelectionMode(false);
+    setSelectedIds([]);
+  };
+
+  const handleOpenDeleteModal = (ids: string[], name: string) => {
+    setTargetBuildIds(ids);
+    setTargetBuildName(name);
+    setDeleteModalOpen(true);
+  };
+
+  const handleConfirmDelete = async (type: 'permanent' | 'for_me') => {
+    if (targetBuildIds.length === 0) return;
+    setIsDeleting(true);
+    try {
+      const success = await deleteBuildsAPI(targetBuildIds, type);
+      if (success) {
+        setHistory(prev => prev.filter(b => !targetBuildIds.includes(b.id)));
+        if (isSelectionMode) cancelSelectionMode();
+        setDeleteModalOpen(false);
+      } else {
+        alert('Failed to delete build history');
+      }
+    } catch (e: any) {
+      alert('Error during delete: ' + (e?.message || 'Unknown error'));
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleDeleteSelected = () => {
+    if (selectedIds.length === 0) return;
+    handleOpenDeleteModal(selectedIds, `${selectedIds.length} selected apps`);
+  };
+
+  const _oldHandleDeleteSelected = async () => {
+    if (selectedIds.length === 0) return;
+    if (window.confirm('Are you sure you want to permanently delete the selected APK history?')) {
+      const success = await deleteBuildsAPI(selectedIds);
+      if (success) {
+        setHistory(prev => prev.filter(b => !selectedIds.includes(b.id)));
+        cancelSelectionMode();
+      } else {
+        alert('Failed to delete history');
+      }
+    }
+  };
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setProfileImage(reader.result as string);
+        const storedUser = JSON.parse(localStorage.getItem('user') || '{}');
+        storedUser.photoURL = reader.result;
+        localStorage.setItem('user', JSON.stringify(storedUser));
+        window.dispatchEvent(new Event('auth:updated'));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  return (
+    <div className="container px-4 py-8 md:py-12 max-w-6xl mx-auto">
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h1 className="text-3xl font-display font-bold text-white mb-1">Dashboard</h1>
+          <p className="text-white/40 text-sm">Manage your account and recent builds.</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 md:gap-8">
+        
+        {/* Left Column: Profile */}
+        <div className="space-y-6 lg:col-span-1">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="glass border border-white/10 rounded-3xl p-6 text-center shadow-xl shadow-black/20 relative overflow-hidden"
+          >
+            {/* Background accent */}
+            <div className="absolute -top-10 -left-10 w-32 h-32 bg-blue-500/20 rounded-full blur-3xl" />
+            
+            <div className="relative inline-block group mb-5">
+              <div 
+                onClick={() => fileInputRef.current?.click()}
+                className="w-24 h-24 md:w-28 md:h-28 rounded-full border-2 border-dashed border-white/20 flex items-center justify-center bg-white/5 overflow-hidden cursor-pointer group-hover:border-blue-500/50 transition-colors shadow-lg"
+              >
+                {profileImage ? (
+                  <img src={profileImage} alt="Profile" className="w-full h-full object-cover" />
+                ) : (
+                  <div className="flex flex-col items-center">
+                    <UserIcon className="w-8 h-8 text-white/20 mb-1" />
+                  </div>
+                )}
+                
+                <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity rounded-full">
+                  <Camera className="w-6 h-6 text-white" />
+                </div>
+              </div>
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                onChange={handleImageUpload} 
+                accept="image/*" 
+                className="hidden" 
+              />
+            </div>
+
+            <h2 className="text-xl font-bold font-display truncate mb-1 text-white/90">{user.fullName}</h2>
+            <p className="text-white/40 text-sm truncate mb-6">{user.email}</p>
+
+            
+            <button 
+              onClick={handleLogout}
+              className="flex items-center justify-center w-full gap-2 py-3 rounded-xl bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:text-red-300 text-sm font-bold transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Sign Out
+            </button>
+          </motion.div>
+
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.1 }}
+            className="glass border border-white/10 rounded-3xl p-6 relative overflow-hidden bg-gradient-to-br from-white/[0.03] to-white/[0.01]"
+          >
+            <div className="absolute -bottom-6 -right-6 p-4 opacity-5 pointer-events-none">
+              <Shield className="w-24 h-24 text-blue-400" />
+            </div>
+            <p className="text-white/40 text-xs uppercase tracking-widest font-bold mb-3">Plan Status</p>
+            <h3 className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
+              {isAdmin ? (
+                <>
+                  Administrator <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-semibold border border-purple-500/30">Super Admin</span>
+                </>
+              ) : (
+                <>
+                  Free Plan <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-semibold border border-emerald-500/30">Active</span>
+                </>
+              )}
+            </h3>
+            
+            <div className="space-y-3.5 mt-5">
+               <div className="flex justify-between items-center text-sm py-1.5 border-b border-white/[0.04]">
+                 <span className="text-white/60">Build Quota:</span>
+                 {isAdmin ? (
+                   <span className="font-mono font-bold text-xs text-purple-300 bg-purple-500/10 border border-purple-500/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                     ∞ Unlimited
+                   </span>
+                 ) : (
+                   <span className="font-mono font-bold text-xs text-[#00f2fe] bg-[#00f2fe]/10 border border-[#00f2fe]/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                     {creditState.creditsRemaining} / 3 Builds
+                   </span>
+                 )}
+               </div>
+
+               <div className="flex justify-between items-center text-sm py-1.5 border-b border-white/[0.04]">
+                 <span className="text-white/60">Auto-Renewal:</span>
+                 {isAdmin ? (
+                   <span className="font-mono text-xs font-semibold text-purple-300 bg-purple-500/10 border border-purple-500/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                     Continuous
+                   </span>
+                 ) : (
+                   <span className="font-medium text-white/90 text-xs">
+                     Every 7 Days
+                   </span>
+                 )}
+               </div>
+
+               <div className="flex justify-between items-center text-sm py-1.5 border-b border-white/[0.04]">
+                 <span className="text-white/60">Next Refill:</span>
+                 {isAdmin ? (
+                   <span className="font-mono text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                     No Limits
+                   </span>
+                 ) : (
+                   <span className="font-mono text-xs font-semibold text-cyan-300 bg-cyan-500/10 border border-cyan-500/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                     {resetCountdown}
+                   </span>
+                 )}
+               </div>
+
+               <div className="flex justify-between items-center text-sm py-1.5">
+                 <span className="text-white/60">History Slots:</span>
+                 <span className="font-mono font-semibold text-white/90 text-xs">
+                   {isAdmin ? (
+                     <span className="text-purple-300 bg-purple-500/10 border border-purple-500/20 px-2.5 py-1 rounded-lg whitespace-nowrap">
+                       ∞ Unlimited
+                     </span>
+                   ) : (
+                     `${history.length} / ${creditState.historyLimit} Slots`
+                   )}
+                 </span>
+               </div>
+            </div>
+
+            <div className="mt-5 pt-4 border-t border-white/5 text-center text-xs font-medium flex items-center justify-center gap-1.5 relative z-10">
+              {isAdmin ? (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse"></span>
+                  <span className="text-purple-300/90">Administrative Access • Zero Restrictions</span>
+                </>
+              ) : (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span className="text-emerald-400/90">Free Plan • 7-Day Auto-Refill Cycle</span>
+                </>
+              )}
+            </div>
+          </motion.div>
+        </div>
+
+        {/* Right Column: Build History */}
+        <div className="lg:col-span-3">
+          <motion.div
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            className="glass border border-white/10 rounded-3xl p-6 md:p-8 min-h-[450px] flex flex-col shadow-xl shadow-black/20"
+          >
+            <div className="flex items-center justify-between mb-8 border-b border-white/5 pb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-blue-600/20 to-purple-600/20 flex items-center justify-center border border-white/5">
+                  <Box className="w-6 h-6 text-blue-400" />
+                </div>
+                <h2 className="text-2xl font-bold font-display">Your Apps</h2>
+              </div>
+              <div className="flex items-center gap-2">
+                {isSelectionMode ? (
+                  <>
+                    <button
+                      onClick={handleDeleteSelected}
+                      disabled={selectedIds.length === 0}
+                      className="text-sm font-bold text-white bg-red-600 px-4 py-2 rounded-lg hover:bg-red-500 transition-colors disabled:opacity-50"
+                    >
+                      Delete Selected
+                    </button>
+                    <button
+                      onClick={cancelSelectionMode}
+                      className="text-sm font-bold text-white/70 bg-white/10 px-4 py-2 rounded-lg hover:bg-white/20 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {history.length > 0 && (
+                      <button
+                        onClick={handleClearHistoryClick}
+                        className="text-sm font-bold text-red-400/70 hover:text-red-400 transition-colors flex items-center gap-1 bg-red-500/10 px-3 py-2 rounded-lg hover:bg-red-500/20"
+                        title="Delete History"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        Delete
+                      </button>
+                    )}
+                    <button onClick={() => navigate('/build')} className="text-sm font-bold text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1 bg-blue-500/10 px-4 py-2 rounded-lg hover:bg-blue-500/20">
+                      + New Build
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {loading ? (
+              <div className="flex flex-col items-center justify-center flex-1 text-center opacity-80">
+                <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-4" />
+                <p className="text-white/40">Loading build history...</p>
+              </div>
+            ) : history.length === 0 ? (
+              <div className="flex flex-col items-center justify-center flex-1 text-center space-y-4 opacity-80">
+                <div className="w-20 h-20 rounded-full bg-white/5 flex items-center justify-center border border-dashed border-white/20 mb-2 shadow-inner">
+                  <Box className="w-8 h-8 text-white/20" />
+                </div>
+                <h3 className="text-xl font-bold text-white/80">No apps built yet</h3>
+                <p className="text-white/40 text-sm max-w-sm">You haven't converted any projects to APK yet. Start your first build to see it here.</p>
+                <button 
+                  onClick={() => navigate('/build')}
+                  className="mt-4 px-6 py-3 bg-white/10 hover:bg-white/15 border border-white/10 rounded-xl font-medium transition-colors"
+                >
+                  Create your first app
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {history.map((build: any) => (
+                  <div 
+                    key={build.id} 
+                    className="flex flex-col sm:flex-row sm:items-center justify-between p-5 rounded-2xl bg-white/[0.03] border border-white/10 hover:border-blue-500/30 hover:bg-white/[0.05] transition-all group gap-4 shadow-sm"
+                  >
+                    <div className="flex items-center gap-4">
+                      {isSelectionMode && (
+                        <input 
+                          type="checkbox" 
+                          checked={selectedIds.includes(build.id)}
+                          onChange={() => toggleSelection(build.id)}
+                          className="w-5 h-5 rounded border-white/20 bg-white/5 checked:bg-blue-500 focus:ring-blue-500 focus:ring-offset-0 focus:ring-2 focus:outline-none transition-all cursor-pointer"
+                        />
+                      )}
+                      <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-blue-600/20 to-purple-600/20 flex items-center justify-center border border-white/5 group-hover:scale-105 transition-transform">
+                        <Box className="w-6 h-6 text-blue-400" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-white text-lg group-hover:text-blue-400 transition-colors tracking-tight">{build.app_name}</h4>
+                        <p className="text-xs text-white/40 mt-1">
+                          {new Date(build.created_at).toLocaleDateString()} • v{build.app_version || '1.0.0'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex sm:justify-end items-center gap-3">
+                       {build.status === 'Completed' && (
+                         <a 
+                           href={build.downloadUrl ? (build.downloadUrl.startsWith('http') ? build.downloadUrl : `${API_BASE_URL}${build.downloadUrl}`) : '#'}
+                           onClick={(e) => { if (!build.downloadUrl) { e.preventDefault(); alert('Download link is unavailable for this older build.'); } }}
+                           download
+                           className="text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white flex items-center gap-1.5 transition-colors shadow-lg shadow-blue-900/20"
+                         >
+                           <Download className="w-3 h-3" /> Download APK
+                         </a>
+                       )}
+                       <span className={`text-xs font-bold px-3 py-1 rounded-full border ${
+                         build.status === 'Completed' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                         build.status === 'Building' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' :
+                         'bg-red-500/10 text-red-400 border-red-500/20'
+                       }`}>
+                         {build.status} {build.status === 'Building' ? `(${build.progress || 0}%)` : ''}
+                       </span>
+                       {build.status === 'Completed' && (() => {
+                          const createdDate = new Date(build.created_at);
+                          const now = new Date();
+                          const createdMidnight = new Date(createdDate.getFullYear(), createdDate.getMonth(), createdDate.getDate()).getTime();
+                          const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+                          const calendarDaysPassed = Math.max(0, Math.floor((todayMidnight - createdMidnight) / (1000 * 60 * 60 * 24)));
+                          const daysLeft = Math.max(0, 30 - calendarDaysPassed);
+
+                          if (daysLeft === 0) {
+                            return (
+                              <span className="text-[11px] font-medium text-red-400 bg-red-500/10 border border-red-500/20 px-2 py-0.5 rounded-full flex items-center gap-1 shadow-sm" title="30-day retention expired">
+                                <Clock className="w-3 h-3 text-red-400" />
+                                Expired
+                              </span>
+                            );
+                          }
+
+                          return (
+                            <span className="text-[11px] font-medium text-amber-300/80 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-full flex items-center gap-1 shadow-sm" title={`30-day active retention: ${daysLeft} days remaining before auto-purge`}>
+                              <Clock className="w-3 h-3 text-amber-400" />
+                              {daysLeft}d left
+                            </span>
+                          );
+                        })()}
+                       <button
+                         onClick={() => handleOpenDeleteModal([build.id], build.app_name)}
+                         className="p-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 transition-colors ml-1"
+                         title="Delete this APK build"
+                       >
+                         <Trash2 className="w-3.5 h-3.5" />
+                       </button>
+                       <span className="text-xs text-white/20 flex items-center gap-1">
+                         <Clock className="w-3 h-3" />
+                         {new Date(build.created_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}
+                       </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+            </div>
+      </div>
+      {/* 2-Option Delete Confirmation Modal */}
+      {deleteModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="glass border border-white/15 bg-neutral-900/95 max-w-md w-full rounded-3xl p-6 shadow-2xl relative overflow-hidden text-left"
+          >
+            {/* Close button */}
+            <button
+              onClick={() => !isDeleting && setDeleteModalOpen(false)}
+              className="absolute top-5 right-5 text-white/40 hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-12 h-12 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-xl font-bold text-white font-display">Delete APK Build</h3>
+                <p className="text-xs text-white/50 truncate max-w-[240px]">
+                  {targetBuildName}
+                </p>
+              </div>
+            </div>
+
+            <p className="text-sm text-white/70 mb-5 leading-relaxed">
+              Choose how you want to remove this build from your account:
+            </p>
+
+            <div className="space-y-3 mb-6">
+              {/* Option 1: Delete for Me (7 Days Vault) */}
+              <button
+                disabled={isDeleting}
+                onClick={() => handleConfirmDelete('for_me')}
+                className="w-full text-left p-4 rounded-2xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 transition-all group flex items-start gap-3.5 relative disabled:opacity-50"
+              >
+                <div className="w-9 h-9 rounded-xl bg-blue-500/20 flex items-center justify-center text-blue-400 flex-shrink-0 mt-0.5">
+                  <Archive className="w-4 h-4" />
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-white text-sm group-hover:text-blue-300 transition-colors">
+                      Delete for Me
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                      7-Day Vault
+                    </span>
+                  </div>
+                  <p className="text-xs text-white/50 mt-1 leading-relaxed">
+                    Hides from your active dashboard. Kept in 7-day backup vault (<code className="text-blue-300/80 text-[11px]">apk_removed</code>), then auto-purged on day 7.
+                  </p>
+                </div>
+              </button>
+
+              {/* Option 2: Permanent Delete (Permanent Delete) */}
+              <button
+                disabled={isDeleting}
+                onClick={() => handleConfirmDelete('permanent')}
+                className="w-full text-left p-4 rounded-2xl border border-red-500/30 bg-red-500/10 hover:bg-red-500/20 transition-all group flex items-start gap-3.5 relative disabled:opacity-50"
+              >
+                <div className="w-9 h-9 rounded-xl bg-red-500/20 flex items-center justify-center text-red-400 flex-shrink-0 mt-0.5">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-white text-sm group-hover:text-red-300 transition-colors">
+                      Delete for Everyone
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded-full bg-red-500/20 text-red-300 border border-red-500/30">
+                      Permanent Delete
+                    </span>
+                  </div>
+                  <p className="text-xs text-white/50 mt-1 leading-relaxed">
+                    Permanently wipes the APK file and data completely from disk and database for everyone. Cannot be recovered.
+                  </p>
+                </div>
+              </button>
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                disabled={isDeleting}
+                onClick={() => setDeleteModalOpen(false)}
+                className="px-5 py-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-sm font-semibold transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </div>
+  );
+}
